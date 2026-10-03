@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  StudyFlow - Multi-Tenant Serverless SaaS Study Planner
+  Production-ready AWS SAM template provisioning Cognito, API Gateway,
+  Lambda functions, DynamoDB (Single-Table Multi-Tenant), S3, and CloudWatch.
+
+Globals:
+  Function:
+    Timeout: 15
+    MemorySize: 256
+    Runtime: nodejs20.x
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref StudyFlowTable
+        USER_POOL_ID: !Ref StudyFlowUserPool
+        CLIENT_ID: !Ref StudyFlowUserPoolClient
+        ATTACHMENTS_BUCKET: !Ref StudyFlowNotesBucket
+        NODE_OPTIONS: '--enable-source-maps'
+
+Resources:
+  # ==========================================
+  # 1. AUTHENTICATION: Amazon Cognito
+  # ==========================================
+  StudyFlowUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: StudyFlow-UserPool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: academicLevel
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+        - Name: institution
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+        - Name: tenantId
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  StudyFlowUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: StudyFlow-WebClient
+      UserPoolId: !Ref StudyFlowUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ==========================================
+  # 2. REST API: Amazon API Gateway (HTTP API)
+  # ==========================================
+  StudyFlowApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: StudyFlow-Api
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Tenant-Id
+        AllowOrigins:
+          - '*'
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${StudyFlowUserPool}
+              audience:
+                - !Ref StudyFlowUserPoolClient
+
+  # ==========================================
+  # 3. DATABASE: Amazon DynamoDB Multi-Tenant
+  # ==========================================
+  StudyFlowTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: StudyFlow-Data
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ==========================================
+  # 4. STORAGE: Amazon S3 for Attachments
+  # ==========================================
+  StudyFlowNotesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub studyflow-notes-${AWS::AccountId}-${AWS::Region}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3600
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ==========================================
+  # 5. SERVERLESS LOGIC: AWS Lambda API Handlers
+  # ==========================================
+  StudyFlowApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: dist/lambda.handler
+      Description: Core multi-tenant router and controller enforcing tenant isolation
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StudyFlowTable
+        - S3CrudPolicy:
+            BucketName: !Ref StudyFlowNotesBucket
+      Events:
+        # Public auth routes (bypass authorizer)
+        AuthPublic:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref StudyFlowApi
+            Path: /api/auth/{proxy+}
+            Method: ANY
+            Auth:
+              Authorizer: NONE
+        # Protected multi-tenant application routes
+        ProtectedApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref StudyFlowApi
+            Path: /api/{proxy+}
+            Method: ANY
+
+  # ==========================================
+  # 6. SCHEDULED TASKS: Amazon EventBridge
+  # ==========================================
+  DailyStudyReminderSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers daily reminder notifications for upcoming exams and due assignments
+      ScheduleExpression: cron(0 7 * * ? *) # Daily at 7:00 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StudyFlowReminderFunction.Arn
+          Id: StudyFlowDailyDigestTarget
+
+  StudyFlowReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: dist/handlers/reminderCron.handler
+      Description: Scans upcoming assignments and exams per tenant and sends digest
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref StudyFlowTable
+        - SESCrudPolicy:
+            IdentityName: '*'
+
+  PermissionForEventsToInvokeReminder:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StudyFlowReminderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyStudyReminderSchedule.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API Gateway endpoint URL
+    Value: !Sub https://${StudyFlowApi}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref StudyFlowUserPool
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref StudyFlowUserPoolClient
+  DynamoTableName:
+    Description: Multi-tenant DynamoDB Table
+    Value: !Ref StudyFlowTable
+  S3BucketName:
+    Description: Attachments and Notes S3 Bucket
+    Value: !Ref StudyFlowNotesBucket

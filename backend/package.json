@@ -1,0 +1,28 @@
+{
+  "name": "studyflow-backend",
+  "version": "1.0.0",
+  "description": "StudyFlow Multi-Tenant SaaS Serverless Backend",
+  "main": "dist/localServer.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node-dev --respawn --transpile-only src/localServer.ts",
+    "start": "node dist/localServer.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.750.0",
+    "@aws-sdk/client-dynamodb": "^3.750.0",
+    "@aws-sdk/client-s3": "^3.750.0",
+    "@aws-sdk/lib-dynamodb": "^3.750.0",
+    "@aws-sdk/s3-request-presigner": "^3.750.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.7.3"
+  }
+}
